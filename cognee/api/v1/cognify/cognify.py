@@ -22,10 +22,13 @@ from cognee.tasks.documents import (
 from cognee.tasks.graph import extract_graph_from_data
 from cognee.tasks.storage import add_data_points
 from cognee.tasks.summarization import summarize_text
-from cognee.modules.data.models import FileProcessingStatus
+from cognee.modules.data.models import FileProcessingStatus, Data
 from cognee.modules.data.methods import (
     prepare_files_for_tracking,
     set_files_processing_status,
+    update_file_processing_status_batch,
+    get_datasets_by_name,
+    get_dataset_data,
 )
 
 logger = get_logger("cognify")
@@ -232,7 +235,10 @@ async def run_cognify_blocking(
         # Set files to PROCESSING status at pipeline start
         await set_files_processing_status(file_data_items, FileProcessingStatus.PROCESSING)
         
-        # Execute pipeline
+        # Track processing results per dataset
+        dataset_results = {}
+        
+        # Execute pipeline and track dataset-level success/failure
         async for run_info in cognee_pipeline(
             tasks=tasks,
             datasets=datasets,
@@ -241,20 +247,57 @@ async def run_cognify_blocking(
             graph_db_config=graph_db_config,
             vector_db_config=vector_db_config,
         ):
+            # Track dataset processing results
+            if hasattr(run_info, 'dataset_id'):
+                if isinstance(run_info, PipelineRunCompleted):
+                    dataset_results[run_info.dataset_id] = "SUCCESS"
+                elif isinstance(run_info, PipelineRunErrored):
+                    dataset_results[run_info.dataset_id] = "ERROR"
+            
             if run_info.dataset_id:
                 total_run_info[run_info.dataset_id] = run_info
             else:
                 total_run_info = run_info
         
-        # Set files to PROCESSED status on successful completion
-        await set_files_processing_status(file_data_items, FileProcessingStatus.PROCESSED)
+        # Update file statuses based on dataset results
+        successful_files = []
+        failed_files = []
+        
+        for data_item in file_data_items:
+            # Find which dataset this file belongs to
+            dataset_id = None
+            for dataset_name in datasets:
+                dataset_results_list = await get_datasets_by_name([dataset_name], user.id)
+                if dataset_results_list:
+                    dataset = dataset_results_list[0]
+                    # Check if this file belongs to this dataset
+                    dataset_files = await get_dataset_data(dataset.id)
+                    if any(f.id == data_item.id for f in dataset_files):
+                        dataset_id = dataset.id
+                        break
+            
+            # Determine file status based on dataset processing result
+            if dataset_id and dataset_results.get(dataset_id) == "SUCCESS":
+                successful_files.append(data_item.id)
+            else:
+                failed_files.append(data_item.id)
+        
+        # Update file statuses
+        if successful_files:
+            await update_file_processing_status_batch(successful_files, FileProcessingStatus.PROCESSED)
+            logger.info(f"Successfully processed {len(successful_files)} files")
+        
+        if failed_files:
+            await update_file_processing_status_batch(failed_files, FileProcessingStatus.ERROR)
+            logger.warning(f"Failed to process {len(failed_files)} files out of {len(file_data_items)}")
         
         return total_run_info
         
     except Exception as error:
         logger.error(f"Cognify pipeline failed: {error}")
-        # Set files to ERROR status on pipeline failure
-        await set_files_processing_status(file_data_items, FileProcessingStatus.ERROR)
+        # Mark all files as ERROR if pipeline completely fails
+        all_file_ids = [data.id for data in file_data_items]
+        await update_file_processing_status_batch(all_file_ids, FileProcessingStatus.ERROR)
         raise
 
 
@@ -282,8 +325,9 @@ async def run_cognify_as_background_process(
     pipeline_run_started_info = []
 
     async def handle_rest_of_the_run(pipeline_list):
-        # Execute all provided pipelines one by one to avoid database write conflicts
-        pipeline_success = True
+        # Track dataset processing results
+        dataset_results = {}
+        
         try:
             for pipeline in pipeline_list:
                 try:
@@ -291,33 +335,68 @@ async def run_cognify_as_background_process(
                         try:
                             pipeline_run_info = await anext(pipeline)
 
+                            # Track dataset processing results
+                            if hasattr(pipeline_run_info, 'dataset_id'):
+                                if isinstance(pipeline_run_info, PipelineRunCompleted):
+                                    dataset_results[pipeline_run_info.dataset_id] = "SUCCESS"
+                                elif isinstance(pipeline_run_info, PipelineRunErrored):
+                                    dataset_results[pipeline_run_info.dataset_id] = "ERROR"
+
                             push_to_queue(pipeline_run_info.pipeline_run_id, pipeline_run_info)
 
                             if isinstance(pipeline_run_info, PipelineRunCompleted) or isinstance(
                                 pipeline_run_info, PipelineRunErrored
                             ):
-                                if isinstance(pipeline_run_info, PipelineRunErrored):
-                                    pipeline_success = False
                                 break
                         except StopAsyncIteration:
                             break
                 except Exception as error:
                     logger.error(f"Background cognify pipeline failed: {error}")
-                    pipeline_success = False
         except Exception as error:
             logger.error(f"Background cognify process failed: {error}")
-            pipeline_success = False
         
-        # Set final status based on pipeline success
+        # Update file statuses based on dataset results
         try:
-            final_status = FileProcessingStatus.PROCESSED if pipeline_success else FileProcessingStatus.ERROR
-            await set_files_processing_status(file_data_items, final_status)
-            logger.info(f"Background cognify completed with status: {final_status.value}")
+            successful_files = []
+            failed_files = []
+            
+            for data_item in file_data_items:
+                # Find which dataset this file belongs to
+                dataset_id = None
+                for dataset_name in datasets:
+                    dataset_results_list = await get_datasets_by_name([dataset_name], user.id)
+                    if dataset_results_list:
+                        dataset = dataset_results_list[0]
+                        # Check if this file belongs to this dataset
+                        dataset_files = await get_dataset_data(dataset.id)
+                        if any(f.id == data_item.id for f in dataset_files):
+                            dataset_id = dataset.id
+                            break
+                
+                # Determine file status based on dataset processing result
+                if dataset_id and dataset_results.get(dataset_id) == "SUCCESS":
+                    successful_files.append(data_item.id)
+                else:
+                    failed_files.append(data_item.id)
+            
+            # Update file statuses
+            if successful_files:
+                await update_file_processing_status_batch(successful_files, FileProcessingStatus.PROCESSED)
+                logger.info(f"Background processing: {len(successful_files)} files processed successfully")
+            
+            if failed_files:
+                await update_file_processing_status_batch(failed_files, FileProcessingStatus.ERROR)
+                logger.warning(f"Background processing: {len(failed_files)} files failed")
+            
+            final_status = "PARTIAL_SUCCESS" if successful_files and failed_files else ("PROCESSED" if successful_files else "ERROR")
+            logger.info(f"Background cognify completed with status: {final_status}")
+            
         except Exception as error:
             logger.error(f"Failed to set final status in background process: {error}")
             # Ensure files are marked as ERROR if we can't set final status
             try:
-                await set_files_processing_status(file_data_items, FileProcessingStatus.ERROR)
+                all_file_ids = [data.id for data in file_data_items]
+                await update_file_processing_status_batch(all_file_ids, FileProcessingStatus.ERROR)
             except Exception:
                 logger.error("Failed to set ERROR status as fallback")
 
