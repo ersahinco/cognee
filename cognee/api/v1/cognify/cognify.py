@@ -234,7 +234,6 @@ async def run_cognify_blocking(
     
     total_run_info = {}
     
-    # Execute pipeline - original simple approach
     async for run_info in cognee_pipeline(
         tasks=tasks,
         datasets=datasets,
@@ -250,7 +249,6 @@ async def run_cognify_blocking(
             total_run_info[run_info.dataset_id] = run_info
         else:
             total_run_info = run_info
-    
     return total_run_info
 
 
@@ -280,6 +278,7 @@ async def run_cognify_as_background_process(
     pipeline_run_started_info = []
 
     async def handle_rest_of_the_run(pipeline_list, file_data_items):
+        # Execute all provided pipelines one by one to avoid database write conflicts
         for pipeline in pipeline_list:
             while True:
                 try:
@@ -289,7 +288,7 @@ async def run_cognify_as_background_process(
                     await update_file_status_from_pipeline_run(pipeline_run_info, file_data_items)
                     
                     push_to_queue(pipeline_run_info.pipeline_run_id, pipeline_run_info)
-                    
+
                     if isinstance(pipeline_run_info, PipelineRunCompleted) or isinstance(
                         pipeline_run_info, PipelineRunErrored
                     ):
