@@ -1,5 +1,5 @@
 import json
-from typing import Any
+from typing import Any, List, Set
 from uuid import UUID, uuid4
 
 from cognee.infrastructure.databases.relational import get_relational_engine
@@ -100,6 +100,17 @@ async def run_tasks(
 
     pipeline_run_id = pipeline_run.pipeline_run_id
 
+    # Track original file IDs from input data
+    initial_file_ids = set()
+    if isinstance(data, list):
+        for item in data:
+            if hasattr(item, 'id'):
+                initial_file_ids.add(item.id)
+    elif hasattr(data, 'id'):
+        initial_file_ids.add(data.id)
+
+    logger.info(f"Pipeline tracking {len(initial_file_ids)} initial files: {list(initial_file_ids)}")
+
     yield PipelineRunStarted(
         pipeline_run_id=pipeline_run_id,
         dataset_id=dataset.id,
@@ -108,6 +119,9 @@ async def run_tasks(
     )
 
     try:
+        last_result = None
+        processed_file_ids = set()  # Track successfully processed files
+        
         async for result in run_tasks_with_telemetry(
             tasks=tasks,
             data=data,
@@ -115,6 +129,11 @@ async def run_tasks(
             pipeline_name=pipeline_id,
             context=context,
         ):
+            last_result = result
+            
+            # Mark all files as processed since we got a result
+            processed_file_ids.update(initial_file_ids)
+            
             yield PipelineRunYield(
                 pipeline_run_id=pipeline_run_id,
                 dataset_id=dataset.id,
@@ -122,17 +141,33 @@ async def run_tasks(
                 payload=result,
             )
 
+        # Determine which files failed (if any)
+        failed_file_ids = initial_file_ids - processed_file_ids
+
+        logger.info(f"Pipeline completed - Processed: {len(processed_file_ids)}, Failed: {len(failed_file_ids)}")
+        if processed_file_ids:
+            logger.info(f"Successfully processed file IDs: {list(processed_file_ids)}")
+        if failed_file_ids:
+            logger.warning(f"Failed file IDs: {list(failed_file_ids)}")
+
         await log_pipeline_run_complete(
-            pipeline_run_id, pipeline_id, pipeline_name, dataset_id, data
+            pipeline_run_id, pipeline_id, pipeline_name, dataset_id, last_result
         )
 
         yield PipelineRunCompleted(
             pipeline_run_id=pipeline_run_id,
             dataset_id=dataset.id,
             dataset_name=dataset.name,
+            processed_file_ids=list(processed_file_ids) if processed_file_ids else None,
+            failed_file_ids=list(failed_file_ids) if failed_file_ids else None,
         )
 
     except Exception as error:
+        # On error, mark all unprocessed files as failed
+        failed_file_ids = initial_file_ids - processed_file_ids
+
+        logger.error(f"Pipeline errored - Processed: {len(processed_file_ids)}, Failed: {len(failed_file_ids)}")
+
         await log_pipeline_run_error(
             pipeline_run_id, pipeline_id, pipeline_name, dataset_id, data, error
         )
@@ -142,6 +177,8 @@ async def run_tasks(
             payload=error,
             dataset_id=dataset.id,
             dataset_name=dataset.name,
+            processed_file_ids=list(processed_file_ids) if processed_file_ids else None,
+            failed_file_ids=list(failed_file_ids) if failed_file_ids else None,
         )
 
         raise error

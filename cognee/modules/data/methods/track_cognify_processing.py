@@ -4,7 +4,6 @@ from cognee.modules.data.methods import (
     get_datasets_by_name, 
     get_dataset_data,
     update_file_processing_status_batch,
-    get_files_by_status
 )
 from cognee.shared.logging_utils import get_logger
 
@@ -23,22 +22,8 @@ async def prepare_files_for_tracking(datasets: List[str], user_id: str) -> List:
     return file_data_items
 
 
-async def prepare_unprocessed_files_for_tracking(datasets: List[str], user_id: str) -> List:
-    """Prepare only unprocessed files for processing status tracking (for recovery scenarios)."""
-    file_data_items = []
-    for dataset_name in datasets:
-        dataset_results = await get_datasets_by_name([dataset_name], user_id)
-        if dataset_results:
-            dataset = dataset_results[0]
-            # Get only unprocessed and error files for reprocessing
-            unprocessed_files = await get_files_by_status(dataset.id, FileProcessingStatus.UNPROCESSED)
-            error_files = await get_files_by_status(dataset.id, FileProcessingStatus.ERROR)
-            file_data_items.extend(unprocessed_files + error_files)
-    return file_data_items
-
-
 async def set_files_processing_status(file_data_items: List, status: FileProcessingStatus) -> None:
-    """Set processing status for files with validation."""
+    """Set processing status for files."""
     if not file_data_items:
         return
     

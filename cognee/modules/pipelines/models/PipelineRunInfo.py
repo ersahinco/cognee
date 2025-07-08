@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Optional, List
 from uuid import UUID
 from pydantic import BaseModel
 
@@ -27,9 +27,11 @@ class PipelineRunYield(PipelineRunInfo):
 
 class PipelineRunCompleted(PipelineRunInfo):
     status: str = "PipelineRunCompleted"
-    pass
+    processed_file_ids: Optional[List[UUID]] = None  # Files that were successfully processed
+    failed_file_ids: Optional[List[UUID]] = None     # Files that failed during processing
 
 
 class PipelineRunErrored(PipelineRunInfo):
     status: str = "PipelineRunErrored"
-    pass
+    processed_file_ids: Optional[List[UUID]] = None  # Files that were successfully processed before error
+    failed_file_ids: Optional[List[UUID]] = None     # Files that failed during processing
