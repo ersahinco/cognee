@@ -9,7 +9,7 @@ from cognee.shared.logging_utils import get_logger
 logger = get_logger("file_processing_status")
 
 
-async def update_file_processing_status_batch(
+async def update_processing_status_batch(
     file_ids: List[UUID], 
     status: FileProcessingStatus
 ) -> int:

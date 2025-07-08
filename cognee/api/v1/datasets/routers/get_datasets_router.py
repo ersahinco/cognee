@@ -259,7 +259,7 @@ def get_datasets_router() -> APIRouter:
     ):
         """Get the processing status of a specific file in a dataset."""
         try:
-            from cognee.modules.data.methods import get_dataset, get_file_with_status
+            from cognee.modules.data.methods import get_dataset, get_file_processing_details
             
             # Verify user has access to the dataset
             dataset = await get_dataset(user.id, dataset_id)
@@ -267,7 +267,7 @@ def get_datasets_router() -> APIRouter:
                 raise DatasetNotFoundError(message=f"Dataset ({str(dataset_id)}) not found.")
             
             # Get the file with its processing status
-            file_data = await get_file_with_status(file_id, dataset_id)
+            file_data = await get_file_processing_details(file_id, dataset_id)
             
             if not file_data:
                 raise HTTPException(status_code=404, detail="File not found in the specified dataset")
@@ -295,7 +295,7 @@ def get_datasets_router() -> APIRouter:
     ):
         """Get all files in a dataset with their processing status, optionally filtered by status."""
         try:
-            from cognee.modules.data.methods import get_dataset, get_dataset_files_with_status
+            from cognee.modules.data.methods import get_dataset, get_dataset_files_processing_details
             
             # Verify user has access to the dataset
             dataset = await get_dataset(user.id, dataset_id)
@@ -314,7 +314,7 @@ def get_datasets_router() -> APIRouter:
                     )
             
             # Get files with their processing status
-            files = await get_dataset_files_with_status(dataset_id, status_enum, limit, offset)
+            files = await get_dataset_files_processing_details(dataset_id, status_enum, limit, offset)
             
             return [
                 FileProcessingStatusResponse(
@@ -339,7 +339,7 @@ def get_datasets_router() -> APIRouter:
     ):
         """Reset the processing status of files in a dataset to UNPROCESSED for reprocessing."""
         try:
-            from cognee.modules.data.methods import get_dataset, update_file_processing_status_batch
+            from cognee.modules.data.methods import get_dataset, update_processing_status_batch
             
             # Input validation
             if not file_ids:
@@ -354,7 +354,7 @@ def get_datasets_router() -> APIRouter:
                 raise DatasetNotFoundError(message=f"Dataset ({str(dataset_id)}) not found.")
             
             # Reset file processing status directly
-            await update_file_processing_status_batch(file_ids, FileProcessingStatus.UNPROCESSED)
+            await update_processing_status_batch(file_ids, FileProcessingStatus.UNPROCESSED)
             
             return {
                 "message": f"Successfully reset processing status for {len(file_ids)} files",

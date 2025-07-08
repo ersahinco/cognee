@@ -22,11 +22,10 @@ from cognee.tasks.documents import (
 from cognee.tasks.graph import extract_graph_from_data
 from cognee.tasks.storage import add_data_points
 from cognee.tasks.summarization import summarize_text
-from cognee.modules.data.models import FileProcessingStatus, Data
+from cognee.modules.data.models import FileProcessingStatus
 from cognee.modules.data.methods import (
-    prepare_files_for_tracking,
-    set_files_processing_status,
-    update_file_processing_status_batch,
+    prepare_files_for_status_tracking,
+    update_processing_status_batch,
     get_dataset_data,
 )
 
@@ -226,10 +225,12 @@ async def run_cognify_blocking(
         datasets = [datasets]
     
     # Get file data for tracking
-    file_data_items = await prepare_files_for_tracking(datasets, user.id)
+    file_data_items = await prepare_files_for_status_tracking(datasets, user.id)
     
     # Set files to PROCESSING status at pipeline start
-    await set_files_processing_status(file_data_items, FileProcessingStatus.PROCESSING)
+    if file_data_items:
+        file_ids = [data.id for data in file_data_items]
+        await update_processing_status_batch(file_ids, FileProcessingStatus.PROCESSING)
     
     total_run_info = {}
     
@@ -268,23 +269,32 @@ async def run_cognify_as_background_process(
         datasets = [datasets]
     
     # Get file data for tracking
-    file_data_items = await prepare_files_for_tracking(datasets, user.id)
+    file_data_items = await prepare_files_for_status_tracking(datasets, user.id)
     
     # Set files to PROCESSING status at pipeline start
-    await set_files_processing_status(file_data_items, FileProcessingStatus.PROCESSING)
+    if file_data_items:
+        file_ids = [data.id for data in file_data_items]
+        await update_processing_status_batch(file_ids, FileProcessingStatus.PROCESSING)
     
     # Store pipeline status for all pipelines
     pipeline_run_started_info = []
 
     async def handle_rest_of_the_run(pipeline_list, file_data_items):
         for pipeline in pipeline_list:
-            async for pipeline_run_info in pipeline:
-                # Update file status based on pipeline run completion
-                await update_file_status_from_pipeline_run(pipeline_run_info, file_data_items)
-                
-                push_to_queue(pipeline_run_info.pipeline_run_id, pipeline_run_info)
-                
-                if isinstance(pipeline_run_info, (PipelineRunCompleted, PipelineRunErrored)):
+            while True:
+                try:
+                    pipeline_run_info = await anext(pipeline)
+
+                    # Update file status based on pipeline run completion
+                    await update_file_status_from_pipeline_run(pipeline_run_info, file_data_items)
+                    
+                    push_to_queue(pipeline_run_info.pipeline_run_id, pipeline_run_info)
+                    
+                    if isinstance(pipeline_run_info, PipelineRunCompleted) or isinstance(
+                        pipeline_run_info, PipelineRunErrored
+                    ):
+                        break
+                except StopAsyncIteration:
                     break
 
     # Start all pipelines to get started status
@@ -325,11 +335,11 @@ async def update_file_status_from_pipeline_run(run_info, file_data_items):
         if isinstance(run_info, PipelineRunCompleted):
             # Use file-level results if available, otherwise fall back to dataset-level
             if hasattr(run_info, 'processed_file_ids') and run_info.processed_file_ids:
-                await update_file_processing_status_batch(run_info.processed_file_ids, FileProcessingStatus.PROCESSED)
+                await update_processing_status_batch(run_info.processed_file_ids, FileProcessingStatus.PROCESSED)
                 logger.info(f"Marked {len(run_info.processed_file_ids)} files as PROCESSED for dataset {run_info.dataset_id}")
             
             if hasattr(run_info, 'failed_file_ids') and run_info.failed_file_ids:
-                await update_file_processing_status_batch(run_info.failed_file_ids, FileProcessingStatus.ERROR)
+                await update_processing_status_batch(run_info.failed_file_ids, FileProcessingStatus.ERROR)
                 logger.warning(f"Marked {len(run_info.failed_file_ids)} files as ERROR for dataset {run_info.dataset_id}")
             
             # If no file-level info available, mark all files as processed (backward compatibility)
@@ -338,17 +348,17 @@ async def update_file_status_from_pipeline_run(run_info, file_data_items):
                 dataset_files = await get_dataset_data(run_info.dataset_id)
                 if dataset_files:
                     file_ids = [f.id for f in dataset_files]
-                    await update_file_processing_status_batch(file_ids, FileProcessingStatus.PROCESSED)
+                    await update_processing_status_batch(file_ids, FileProcessingStatus.PROCESSED)
                     logger.info(f"Marked all {len(file_ids)} files as PROCESSED for dataset {run_info.dataset_id} (no file-level data)")
                     
         elif isinstance(run_info, PipelineRunErrored):
             # Use file-level results if available
             if hasattr(run_info, 'processed_file_ids') and run_info.processed_file_ids:
-                await update_file_processing_status_batch(run_info.processed_file_ids, FileProcessingStatus.PROCESSED)
+                await update_processing_status_batch(run_info.processed_file_ids, FileProcessingStatus.PROCESSED)
                 logger.info(f"Marked {len(run_info.processed_file_ids)} files as PROCESSED before error for dataset {run_info.dataset_id}")
             
             if hasattr(run_info, 'failed_file_ids') and run_info.failed_file_ids:
-                await update_file_processing_status_batch(run_info.failed_file_ids, FileProcessingStatus.ERROR)
+                await update_processing_status_batch(run_info.failed_file_ids, FileProcessingStatus.ERROR)
                 logger.warning(f"Marked {len(run_info.failed_file_ids)} files as ERROR for dataset {run_info.dataset_id}")
             
             # If no file-level info available, mark all files as error (backward compatibility)
@@ -357,7 +367,7 @@ async def update_file_status_from_pipeline_run(run_info, file_data_items):
                 dataset_files = await get_dataset_data(run_info.dataset_id)
                 if dataset_files:
                     file_ids = [f.id for f in dataset_files]
-                    await update_file_processing_status_batch(file_ids, FileProcessingStatus.ERROR)
+                    await update_processing_status_batch(file_ids, FileProcessingStatus.ERROR)
                     logger.warning(f"Marked all {len(file_ids)} files as ERROR for dataset {run_info.dataset_id} (no file-level data)")
                     
     except Exception as error:

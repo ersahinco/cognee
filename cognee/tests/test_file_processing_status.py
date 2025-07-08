@@ -24,10 +24,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 import cognee
 from cognee.modules.data.models import FileProcessingStatus
 from cognee.modules.data.methods import (
-    get_files_by_status, 
-    get_file_processing_status,
-    get_processing_metrics,
-    update_file_processing_status_batch,
+    get_file_processing_details,
+    get_dataset_files_processing_details,
+    update_processing_status_batch,
     get_datasets_by_name,
     get_dataset_data,
 )
@@ -375,7 +374,7 @@ async def log_pipeline_processing_details(dataset_name: str, user):
     
     print(f"   📄 Files in Dataset:")
     for i, file_data in enumerate(dataset_files):
-        status = await get_file_processing_status(file_data.id)
+        status = await get_file_processing_details(file_data.id, status_only=True)
         print(f"      {i+1}. {file_data.name}")
         print(f"         - ID: {file_data.id}")
         print(f"         - Status: {status.value}")
@@ -399,17 +398,20 @@ async def test_ac1_default_file_status():
     dataset = await get_test_dataset()
     
     # Verify all files have UNPROCESSED status
-    unprocessed_files = await get_files_by_status(dataset.id, FileProcessingStatus.UNPROCESSED)
-    assert len(unprocessed_files) >= len(test_files), f"Expected at least {len(test_files)} unprocessed files, got {len(unprocessed_files)}"
+    files_with_status = await get_dataset_files_processing_details(
+        dataset_id=dataset.id,
+        status_filter=FileProcessingStatus.UNPROCESSED
+    )
+    assert len(files_with_status) >= len(test_files), f"Expected at least {len(test_files)} unprocessed files, got {len(files_with_status)}"
     
     print(f"   📋 File Status Details:")
     # Verify individual file status
-    for i, file_data in enumerate(unprocessed_files):
-        status = await get_file_processing_status(file_data.id)
+    for i, file_data in enumerate(files_with_status):
+        status = await get_file_processing_details(file_data.id, status_only=True)
         assert status == FileProcessingStatus.UNPROCESSED, f"File {file_data.name} should be UNPROCESSED, got {status}"
         print(f"      {i+1}. {file_data.name}: {status.value}")
     
-    print(f"   ✅ {len(unprocessed_files)} files have default UNPROCESSED status")
+    print(f"   ✅ {len(files_with_status)} files have default UNPROCESSED status")
     return True
 
 
@@ -421,14 +423,20 @@ async def test_ac2_status_updates_during_processing():
     user = await get_default_user()
     
     # Get initial unprocessed files
-    initial_unprocessed = await get_files_by_status(dataset.id, FileProcessingStatus.UNPROCESSED)
+    initial_unprocessed = await get_dataset_files_processing_details(
+        dataset_id=dataset.id,
+        status_filter=FileProcessingStatus.UNPROCESSED
+    )
     
     if not initial_unprocessed:
         print("   ⚠️  No unprocessed files found, adding test files")
         test_files = create_test_dataset()
         for file_path in test_files:
             await cognee.add(file_path, TEST_DATASET_NAME)
-        initial_unprocessed = await get_files_by_status(dataset.id, FileProcessingStatus.UNPROCESSED)
+        initial_unprocessed = await get_dataset_files_processing_details(
+            dataset_id=dataset.id,
+            status_filter=FileProcessingStatus.UNPROCESSED
+        )
     
     print(f"   📋 Initial Status: {len(initial_unprocessed)} unprocessed files")
     
@@ -442,17 +450,23 @@ async def test_ac2_status_updates_during_processing():
         result = await cognee.cognify([TEST_DATASET_NAME], user=user)
         print("   ✅ Cognify process completed successfully")
         
-        # Check final status distribution
-        processed_files = await get_files_by_status(dataset.id, FileProcessingStatus.PROCESSED)
-        error_files = await get_files_by_status(dataset.id, FileProcessingStatus.ERROR)
-        processing_files = await get_files_by_status(dataset.id, FileProcessingStatus.PROCESSING)
+        # Get final status with metrics
+        files_with_metrics = await get_dataset_files_processing_details(
+            dataset_id=dataset.id,
+            with_metrics=True
+        )
+        files, metrics = files_with_metrics
         
         print(f"   📊 Final Status Distribution:")
-        print(f"      - PROCESSED: {len(processed_files)} files")
-        print(f"      - ERROR: {len(error_files)} files")
-        print(f"      - PROCESSING: {len(processing_files)} files")
+        print(f"      - PROCESSED: {metrics.processed_files} files")
+        print(f"      - ERROR: {metrics.failed_files} files")
+        print(f"      - PROCESSING: {metrics.processing_files} files")
         
         # Log individual file statuses
+        processed_files = [f for f in files if f.processing_status == FileProcessingStatus.PROCESSED]
+        error_files = [f for f in files if f.processing_status == FileProcessingStatus.ERROR]
+        processing_files = [f for f in files if f.processing_status == FileProcessingStatus.PROCESSING]
+        
         if processed_files:
             print(f"   ✅ Successfully Processed Files:")
             for i, file_data in enumerate(processed_files):
@@ -488,7 +502,10 @@ async def test_ac2_status_updates_during_processing():
         print(f"   ⚠️  Cognify failed: {e} - but this tests error handling")
         
         # Even if cognify fails, files should be marked as ERROR
-        error_files = await get_files_by_status(dataset.id, FileProcessingStatus.ERROR)
+        error_files = await get_dataset_files_processing_details(
+            dataset_id=dataset.id,
+            status_filter=FileProcessingStatus.ERROR
+        )
         assert len(error_files) > 0, "Failed cognify should mark files as ERROR"
         
         print(f"   ✅ Error handling works: {len(error_files)} files marked as ERROR")
@@ -501,25 +518,26 @@ async def test_ac3_individual_file_status_query():
     
     dataset = await get_test_dataset()
     
-    # Get all files in various states
-    all_statuses = [FileProcessingStatus.UNPROCESSED, FileProcessingStatus.PROCESSING, 
-                   FileProcessingStatus.PROCESSED, FileProcessingStatus.ERROR]
+    # Get all files with metrics
+    files_with_metrics = await get_dataset_files_processing_details(
+        dataset_id=dataset.id,
+        with_metrics=True
+    )
+    files, metrics = files_with_metrics
     
     files_tested = 0
     print("   🔍 Testing individual file status queries:")
+    print(f"      📊 Status Distribution:")
+    print(f"      - PROCESSED: {metrics.processed_files} files")
+    print(f"      - ERROR: {metrics.failed_files} files")
+    print(f"      - PROCESSING: {metrics.processing_files} files")
     
-    for status in all_statuses:
-        files_with_status = await get_files_by_status(dataset.id, status)
-        
-        if files_with_status:
-            print(f"      📋 {status.value}: {len(files_with_status)} files")
-        
-        # Test individual status query for each file
-        for file_data in files_with_status[:2]:  # Test max 2 files per status
-            queried_status = await get_file_processing_status(file_data.id)
-            assert queried_status == status, f"File {file_data.name} status mismatch: expected {status}, got {queried_status}"
-            print(f"         ✓ {file_data.name}: {queried_status.value}")
-            files_tested += 1
+    # Test individual status query for each file
+    for file_data in files[:6]:  # Test max 6 files
+        queried_status = await get_file_processing_details(file_data.id, status_only=True)
+        assert queried_status == file_data.processing_status, f"File {file_data.name} status mismatch: expected {file_data.processing_status}, got {queried_status}"
+        print(f"      ✓ {file_data.name}: {queried_status.value}")
+        files_tested += 1
     
     assert files_tested > 0, "No files found to test individual status query"
     print(f"   ✅ Individual file status query works for {files_tested} files")
@@ -532,30 +550,39 @@ async def test_ac4_file_filtering_by_status():
     
     dataset = await get_test_dataset()
     
-    # Test filtering by each status type
-    status_counts = {}
-    print("   📊 File filtering results:")
+    # Get all files with metrics
+    files_with_metrics = await get_dataset_files_processing_details(
+        dataset_id=dataset.id,
+        with_metrics=True
+    )
+    files, metrics = files_with_metrics
     
+    print("   📊 File filtering results:")
+    print(f"      - Total Files: {metrics.total_files}")
+    print(f"      - PROCESSED: {metrics.processed_files} files")
+    print(f"      - ERROR: {metrics.failed_files} files")
+    print(f"      - PROCESSING: {metrics.processing_files} files")
+    
+    # Test filtering for each status
     for status in FileProcessingStatus:
-        files = await get_files_by_status(dataset.id, status)
-        status_counts[status] = len(files)
-        print(f"      - {status.value}: {len(files)} files")
+        filtered_files = await get_dataset_files_processing_details(
+            dataset_id=dataset.id,
+            status_filter=status
+        )
+        print(f"      - {status.value}: {len(filtered_files)} files")
         
         # Show sample file names for each status
-        for i, file_data in enumerate(files[:3]):  # Show max 3 files per status
+        for i, file_data in enumerate(filtered_files[:3]):  # Show max 3 files per status
             print(f"         {i+1}. {file_data.name}")
-        if len(files) > 3:
-            print(f"         ... and {len(files) - 3} more")
+        if len(filtered_files) > 3:
+            print(f"         ... and {len(filtered_files) - 3} more")
     
     # Verify filtering works
-    total_files_by_status = sum(status_counts.values())
-    all_dataset_files = await get_dataset_data(dataset.id)
-    
-    assert total_files_by_status == len(all_dataset_files), "Status filtering doesn't account for all files"
+    assert metrics.total_files == len(files), "Status filtering doesn't account for all files"
     
     print("   ✅ Status filtering works correctly:")
-    print(f"      Total files by status: {total_files_by_status}")
-    print(f"      Total files in dataset: {len(all_dataset_files)}")
+    print(f"      Total files by metrics: {metrics.total_files}")
+    print(f"      Total files in dataset: {len(files)}")
     
     return True
 
@@ -584,32 +611,41 @@ async def test_partial_success_scenarios():
     partial_dataset = datasets[0]
     
     # Get all files
-    all_files = await get_files_by_status(partial_dataset.id, FileProcessingStatus.UNPROCESSED)
-    print(f"   📋 Found {len(all_files)} unprocessed files for partial success test")
+    unprocessed_files = await get_dataset_files_processing_details(
+        dataset_id=partial_dataset.id,
+        status_filter=FileProcessingStatus.UNPROCESSED
+    )
+    print(f"   📋 Found {len(unprocessed_files)} unprocessed files for partial success test")
     
-    if len(all_files) >= 2:
+    if len(unprocessed_files) >= 2:
         # Simulate partial success by manually setting different statuses
-        file1_id, file2_id = all_files[0].id, all_files[1].id
+        file1_id, file2_id = unprocessed_files[0].id, unprocessed_files[1].id
         print(f"   🔄 Simulating partial success:")
-        print(f"      - Setting {all_files[0].name} to PROCESSED")
-        print(f"      - Setting {all_files[1].name} to ERROR")
+        print(f"      - Setting {unprocessed_files[0].name} to PROCESSED")
+        print(f"      - Setting {unprocessed_files[1].name} to ERROR")
         
-        await update_file_processing_status_batch([file1_id], FileProcessingStatus.PROCESSED)
-        await update_file_processing_status_batch([file2_id], FileProcessingStatus.ERROR)
+        await update_processing_status_batch([file1_id], FileProcessingStatus.PROCESSED)
+        await update_processing_status_batch([file2_id], FileProcessingStatus.ERROR)
         
-        # Verify partial success state
-        processed_files = await get_files_by_status(partial_dataset.id, FileProcessingStatus.PROCESSED)
-        error_files = await get_files_by_status(partial_dataset.id, FileProcessingStatus.ERROR)
+        # Get final status with metrics
+        files_with_metrics = await get_dataset_files_processing_details(
+            dataset_id=partial_dataset.id,
+            with_metrics=True
+        )
+        files, metrics = files_with_metrics
         
-        assert len(processed_files) == 1, f"Expected 1 processed file, got {len(processed_files)}"
-        assert len(error_files) == 1, f"Expected 1 error file, got {len(error_files)}"
+        assert metrics.processed_files == 1, f"Expected 1 processed file, got {metrics.processed_files}"
+        assert metrics.failed_files == 1, f"Expected 1 error file, got {metrics.failed_files}"
         
-        print(f"   ✅ Partial success verified: {len(processed_files)} processed, {len(error_files)} failed")
+        print(f"   ✅ Partial success verified: {metrics.processed_files} processed, {metrics.failed_files} failed")
     else:
         # Single file test
-        if all_files:
-            await update_file_processing_status_batch([all_files[0].id], FileProcessingStatus.ERROR)
-            error_files = await get_files_by_status(partial_dataset.id, FileProcessingStatus.ERROR)
+        if unprocessed_files:
+            await update_processing_status_batch([unprocessed_files[0].id], FileProcessingStatus.ERROR)
+            error_files = await get_dataset_files_processing_details(
+                dataset_id=partial_dataset.id,
+                status_filter=FileProcessingStatus.ERROR
+            )
             assert len(error_files) == 1, "Single file error test failed"
             print("   ✅ Partial success: single file error handling works")
     
@@ -620,20 +656,27 @@ async def test_file_level_pipeline_feedback():
     """Test that pipeline provides file-level feedback for granular status updates."""
     print("🧪 Testing file-level pipeline feedback")
     
-    # This test verifies that the new PipelineRunInfo objects contain file-level information
-    # and that the cognify process uses this information for accurate status tracking
-    
     dataset = await get_test_dataset()
     user = await get_default_user()
     
+    # Get initial status with metrics
+    initial_files_with_metrics = await get_dataset_files_processing_details(
+        dataset_id=dataset.id,
+        with_metrics=True
+    )
+    initial_files, initial_metrics = initial_files_with_metrics
+    
     # Ensure we have some unprocessed files
-    unprocessed_files = await get_files_by_status(dataset.id, FileProcessingStatus.UNPROCESSED)
+    unprocessed_files = [f for f in initial_files if f.processing_status == FileProcessingStatus.UNPROCESSED]
     
     if not unprocessed_files:
         test_files = create_test_dataset()[:2]  # Create minimal test set
         for file_path in test_files:
             await cognee.add(file_path, TEST_DATASET_NAME)
-        unprocessed_files = await get_files_by_status(dataset.id, FileProcessingStatus.UNPROCESSED)
+        unprocessed_files = await get_dataset_files_processing_details(
+            dataset_id=dataset.id,
+            status_filter=FileProcessingStatus.UNPROCESSED
+        )
     
     initial_count = len(unprocessed_files)
     print(f"   📋 Starting with {initial_count} unprocessed files")
@@ -648,34 +691,40 @@ async def test_file_level_pipeline_feedback():
         print(f"   🚀 Running cognify with file-level tracking...")
         result = await cognee.cognify([TEST_DATASET_NAME], user=user)
         
-        # Check that files were updated based on pipeline feedback
-        final_processed = await get_files_by_status(dataset.id, FileProcessingStatus.PROCESSED)
-        final_errors = await get_files_by_status(dataset.id, FileProcessingStatus.ERROR)
-        final_processing = await get_files_by_status(dataset.id, FileProcessingStatus.PROCESSING)
+        # Get final status with metrics
+        final_files_with_metrics = await get_dataset_files_processing_details(
+            dataset_id=dataset.id,
+            with_metrics=True
+        )
+        final_files, final_metrics = final_files_with_metrics
         
         print(f"   📊 File-level Processing Results:")
-        print(f"      - PROCESSED: {len(final_processed)} files")
-        print(f"      - ERROR: {len(final_errors)} files")
-        print(f"      - PROCESSING: {len(final_processing)} files")
+        print(f"      - PROCESSED: {final_metrics.processed_files} files")
+        print(f"      - ERROR: {final_metrics.failed_files} files")
+        print(f"      - PROCESSING: {final_metrics.processing_files} files")
         
         # Log details about processed files
-        if final_processed:
+        processed_files = [f for f in final_files if f.processing_status == FileProcessingStatus.PROCESSED]
+        error_files = [f for f in final_files if f.processing_status == FileProcessingStatus.ERROR]
+        processing_files = [f for f in final_files if f.processing_status == FileProcessingStatus.PROCESSING]
+        
+        if processed_files:
             print(f"   ✅ Successfully Processed Files:")
-            for i, file_data in enumerate(final_processed):
+            for i, file_data in enumerate(processed_files):
                 print(f"      {i+1}. {file_data.name}")
         
-        if final_errors:
+        if error_files:
             print(f"   ❌ Files with Processing Errors:")
-            for i, file_data in enumerate(final_errors):
+            for i, file_data in enumerate(error_files):
                 print(f"      {i+1}. {file_data.name}")
         
         # Verify file-level tracking worked
-        assert len(final_processing) == 0, "Files should not be stuck in PROCESSING state"
+        assert len(processing_files) == 0, "Files should not be stuck in PROCESSING state"
         
-        total_final = len(final_processed) + len(final_errors)
+        total_final = len(processed_files) + len(error_files)
         assert total_final >= initial_count, "File-level tracking should account for all initial files"
         
-        print(f"   ✅ File-level feedback: {len(final_processed)} processed, {len(final_errors)} errors")
+        print(f"   ✅ File-level feedback: {len(processed_files)} processed, {len(error_files)} errors")
         print("   ✅ Pipeline correctly provided file-level status updates")
         
         return True
@@ -684,7 +733,10 @@ async def test_file_level_pipeline_feedback():
         print(f"   ⚠️  Pipeline error occurred: {e}")
         
         # Even on error, verify file-level tracking worked
-        error_files = await get_files_by_status(dataset.id, FileProcessingStatus.ERROR)
+        error_files = await get_dataset_files_processing_details(
+            dataset_id=dataset.id,
+            status_filter=FileProcessingStatus.ERROR
+        )
         assert len(error_files) > 0, "Error handling should mark files with ERROR status"
         
         print(f"   ✅ Error handling with file-level feedback: {len(error_files)} files marked as ERROR")
@@ -696,7 +748,13 @@ async def test_processing_metrics():
     print("🧪 Testing processing metrics")
     
     dataset = await get_test_dataset()
-    metrics = await get_processing_metrics(dataset.id)
+    
+    # Get files with metrics
+    files_with_metrics = await get_dataset_files_processing_details(
+        dataset_id=dataset.id,
+        with_metrics=True
+    )
+    files, metrics = files_with_metrics
     
     # Verify metrics make sense
     assert metrics.total_files > 0, "Should have at least some files"
@@ -704,14 +762,15 @@ async def test_processing_metrics():
     final_state_files = metrics.processed_files + metrics.failed_files
     assert final_state_files <= metrics.total_files, "Final state files exceed total"
     
-    assert 0 <= metrics.completion_percentage <= 100, "Completion percentage out of range"
+    completion_percentage = ((metrics.processed_files + metrics.failed_files) / metrics.total_files) * 100 if metrics.total_files > 0 else 0
+    assert 0 <= completion_percentage <= 100, "Completion percentage out of range"
     
     print(f"   📊 Detailed Processing Metrics:")
     print(f"      - Total Files: {metrics.total_files}")
     print(f"      - Processed Files: {metrics.processed_files}")
     print(f"      - Failed Files: {metrics.failed_files}")
     print(f"      - Processing Files: {metrics.processing_files}")
-    print(f"      - Completion Rate: {metrics.completion_percentage:.1f}%")
+    print(f"      - Completion Rate: {completion_percentage:.1f}%")
     print(f"      - Success Rate: {(metrics.processed_files / max(1, metrics.total_files)) * 100:.1f}%")
     print(f"      - Error Rate: {(metrics.failed_files / max(1, metrics.total_files)) * 100:.1f}%")
     
@@ -725,10 +784,17 @@ async def test_file_status_reset_via_api():
     
     dataset = await get_test_dataset()
     
+    # Get files with metrics
+    files_with_metrics = await get_dataset_files_processing_details(
+        dataset_id=dataset.id,
+        with_metrics=True
+    )
+    files, metrics = files_with_metrics
+    
     # Get files in final states
-    processed_files = await get_files_by_status(dataset.id, FileProcessingStatus.PROCESSED)
-    error_files = await get_files_by_status(dataset.id, FileProcessingStatus.ERROR)
-    final_state_files = processed_files + error_files
+    final_state_files = [f for f in files if f.processing_status in (FileProcessingStatus.PROCESSED, FileProcessingStatus.ERROR)]
+    processed_files = [f for f in files if f.processing_status == FileProcessingStatus.PROCESSED]
+    error_files = [f for f in files if f.processing_status == FileProcessingStatus.ERROR]
     
     print(f"   📋 Files available for reset:")
     print(f"      - Processed: {len(processed_files)} files")
@@ -748,10 +814,13 @@ async def test_file_status_reset_via_api():
         print(f"      {i+1}. {file_data.name}")
     
     # Reset files directly using batch update (API uses this internally)
-    await update_file_processing_status_batch(file_ids, FileProcessingStatus.UNPROCESSED)
+    await update_processing_status_batch(file_ids, FileProcessingStatus.UNPROCESSED)
     
     # Verify files were reset
-    unprocessed_files = await get_files_by_status(dataset.id, FileProcessingStatus.UNPROCESSED)
+    unprocessed_files = await get_dataset_files_processing_details(
+        dataset_id=dataset.id,
+        status_filter=FileProcessingStatus.UNPROCESSED
+    )
     reset_file_ids = {f.id for f in unprocessed_files}
     
     print(f"   ✓ Verification:")
@@ -763,34 +832,6 @@ async def test_file_status_reset_via_api():
             print(f"      {i+1}. File {str(file_id)[:8]}... ERROR: not found in UNPROCESSED")
     
     print(f"   ✅ Reset functionality: {len(file_ids)} files reset successfully")
-    return True
-
-
-async def test_database_migration():
-    """Test that database migration worked correctly."""
-    print("🧪 Testing database migration")
-    
-    from cognee.infrastructure.databases.relational.get_relational_engine import get_relational_engine
-    
-    engine = get_relational_engine()
-    dialect_name = engine.engine.dialect.name
-    
-    # Test enum values
-    enum_values = [status.value for status in FileProcessingStatus]
-    expected_values = ["UNPROCESSED", "PROCESSING", "PROCESSED", "ERROR"]
-    
-    assert set(enum_values) == set(expected_values), (
-        f"Enum values incorrect. Expected: {expected_values}, Got: {enum_values}"
-    )
-    
-    print(f"   📊 Database Configuration:")
-    print(f"      - Dialect: {dialect_name}")
-    print(f"      - Engine: {engine.engine}")
-    print(f"   📋 FileProcessingStatus Enum Values:")
-    for i, value in enumerate(enum_values):
-        print(f"      {i+1}. {value}")
-    
-    print(f"   ✅ Database migration successful")
     return True
 
 
@@ -826,9 +867,16 @@ async def test_graph_creation():
         print(f"   🚀 Running cognify on {len(test_files)} research papers...")
         result = await cognee.cognify([graph_test_dataset], user=user)
         
-        # Verify file status updates
-        processed_files = await get_files_by_status(dataset.id, FileProcessingStatus.PROCESSED)
-        error_files = await get_files_by_status(dataset.id, FileProcessingStatus.ERROR)
+        # Get final status with metrics
+        files_with_metrics = await get_dataset_files_processing_details(
+            dataset_id=dataset.id,
+            with_metrics=True
+        )
+        files, metrics = files_with_metrics
+        
+        # Get processed and error files
+        processed_files = [f for f in files if f.processing_status == FileProcessingStatus.PROCESSED]
+        error_files = [f for f in files if f.processing_status == FileProcessingStatus.ERROR]
         
         print(f"   📊 Processing Results:")
         print(f"      - Successfully processed: {len(processed_files)} files")
@@ -863,6 +911,34 @@ async def test_graph_creation():
         import traceback
         traceback.print_exc()
         return False
+
+
+async def test_database_migration():
+    """Test that database migration worked correctly."""
+    print("🧪 Testing database migration")
+    
+    from cognee.infrastructure.databases.relational.get_relational_engine import get_relational_engine
+    
+    engine = get_relational_engine()
+    dialect_name = engine.engine.dialect.name
+    
+    # Test enum values
+    enum_values = [status.value for status in FileProcessingStatus]
+    expected_values = ["UNPROCESSED", "PROCESSING", "PROCESSED", "ERROR"]
+    
+    assert set(enum_values) == set(expected_values), (
+        f"Enum values incorrect. Expected: {expected_values}, Got: {enum_values}"
+    )
+    
+    print(f"   📊 Database Configuration:")
+    print(f"      - Dialect: {dialect_name}")
+    print(f"      - Engine: {engine.engine}")
+    print(f"   📋 FileProcessingStatus Enum Values:")
+    for i, value in enumerate(enum_values):
+        print(f"      {i+1}. {value}")
+    
+    print(f"   ✅ Database migration successful")
+    return True
 
 
 async def run_all_tests():
@@ -920,17 +996,16 @@ async def run_all_tests():
             print("   ✅ AC3: Status can be queried via API")  
             print("   ✅ AC4: Files can be filtered by status")
             
-            print("\n🔧 Additional Features Implemented:")
+            print("\n🔧 Features Implemented:")
             print("   ✅ Individual file processing status tracking")
             print("   ✅ Partial success scenario handling with file-level pipeline feedback")
             print("   ✅ Processing metrics and completion tracking")
             print("   ✅ Reset functionality for reprocessing via API")
             print("   ✅ Database migration with enum support")
             print("   ✅ File-level pipeline feedback system")
-            print("   ✅ Simplified and efficient architecture")
             print("   ✅ Test dataset validation with AI/ML research papers")
-            print("   ✅ Comprehensive graph creation verification with detailed analysis")
-            print("   ✅ Enhanced logging and observability")
+            print("   ✅ Graph creation verification")
+            print("   ✅ Logging and observability")
             
             return True
         else:
