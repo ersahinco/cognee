@@ -16,10 +16,10 @@ from .get_file_processing_details import (
 )
 
 # Update
-from .update_processing_status import update_processing_status_batch
-
-# Track
-from .track_processing_status import prepare_files_for_status_tracking
+from .update_processing_status import (
+    prepare_files_for_tracking,
+    update_processing_status_batch
+)
 
 # Delete
 from .delete_dataset import delete_dataset

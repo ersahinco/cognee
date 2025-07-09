@@ -100,8 +100,11 @@ async def run_tasks(
 
     pipeline_run_id = pipeline_run.pipeline_run_id
 
-    # Track original file IDs from input data
+    # Track file IDs and their explicit status
     initial_file_ids = set()
+    processed_file_ids = set()
+    failed_file_ids = set()
+    
     if isinstance(data, list):
         for item in data:
             if hasattr(item, 'id'):
@@ -109,7 +112,7 @@ async def run_tasks(
     elif hasattr(data, 'id'):
         initial_file_ids.add(data.id)
 
-    logger.info(f"Pipeline tracking {len(initial_file_ids)} initial files: {list(initial_file_ids)}")
+    logger.info(f"Pipeline tracking {len(initial_file_ids)} files: {list(initial_file_ids)}")
 
     yield PipelineRunStarted(
         pipeline_run_id=pipeline_run_id,
@@ -120,7 +123,6 @@ async def run_tasks(
 
     try:
         last_result = None
-        processed_file_ids = set()  # Track successfully processed files
         
         async for result in run_tasks_with_telemetry(
             tasks=tasks,
@@ -131,8 +133,11 @@ async def run_tasks(
         ):
             last_result = result
             
-            # Mark all files as processed since we got a result
-            processed_file_ids.update(initial_file_ids)
+            # Track only explicitly processed/failed files
+            if hasattr(result, 'processed_files'):
+                processed_file_ids.update(result.processed_files)
+            if hasattr(result, 'failed_files'):
+                failed_file_ids.update(result.failed_files)
             
             yield PipelineRunYield(
                 pipeline_run_id=pipeline_run_id,
@@ -141,14 +146,20 @@ async def run_tasks(
                 payload=result,
             )
 
-        # Determine which files failed (if any)
-        failed_file_ids = initial_file_ids - processed_file_ids
+        # Calculate unprocessed files (not explicitly processed or failed)
+        unprocessed_file_ids = initial_file_ids - processed_file_ids - failed_file_ids
 
-        logger.info(f"Pipeline completed - Processed: {len(processed_file_ids)}, Failed: {len(failed_file_ids)}")
+        logger.info(f"Pipeline completed:")
+        logger.info(f"- Processed: {len(processed_file_ids)} files")
+        logger.info(f"- Failed: {len(failed_file_ids)} files")
+        logger.info(f"- Remaining unprocessed: {len(unprocessed_file_ids)} files")
+
         if processed_file_ids:
             logger.info(f"Successfully processed file IDs: {list(processed_file_ids)}")
         if failed_file_ids:
             logger.warning(f"Failed file IDs: {list(failed_file_ids)}")
+        if unprocessed_file_ids:
+            logger.info(f"Unprocessed file IDs: {list(unprocessed_file_ids)}")
 
         await log_pipeline_run_complete(
             pipeline_run_id, pipeline_id, pipeline_name, dataset_id, last_result
@@ -163,10 +174,13 @@ async def run_tasks(
         )
 
     except Exception as error:
-        # On error, mark all unprocessed files as failed
-        failed_file_ids = initial_file_ids - processed_file_ids
+        # On pipeline error, track unprocessed files separately from failed files
+        unprocessed_file_ids = initial_file_ids - processed_file_ids - failed_file_ids
 
-        logger.error(f"Pipeline errored - Processed: {len(processed_file_ids)}, Failed: {len(failed_file_ids)}")
+        logger.error(f"Pipeline errored:")
+        logger.error(f"- Processed: {len(processed_file_ids)} files")
+        logger.error(f"- Failed: {len(failed_file_ids)} files")
+        logger.error(f"- Remaining unprocessed: {len(unprocessed_file_ids)} files")
 
         await log_pipeline_run_error(
             pipeline_run_id, pipeline_id, pipeline_name, dataset_id, data, error
@@ -179,6 +193,5 @@ async def run_tasks(
             dataset_name=dataset.name,
             processed_file_ids=list(processed_file_ids) if processed_file_ids else None,
             failed_file_ids=list(failed_file_ids) if failed_file_ids else None,
+            unprocessed_file_ids=list(unprocessed_file_ids) if unprocessed_file_ids else None,
         )
-
-        raise error

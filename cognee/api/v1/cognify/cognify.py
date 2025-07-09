@@ -1,6 +1,6 @@
 import asyncio
 from pydantic import BaseModel
-from typing import Union, Optional
+from typing import Union, Optional, List
 
 from cognee.shared.logging_utils import get_logger
 from cognee.shared.data_models import KnowledgeGraph
@@ -24,9 +24,8 @@ from cognee.tasks.storage import add_data_points
 from cognee.tasks.summarization import summarize_text
 from cognee.modules.data.models import FileProcessingStatus
 from cognee.modules.data.methods import (
-    prepare_files_for_status_tracking,
-    update_processing_status_batch,
-    get_dataset_data,
+    prepare_files_for_tracking,
+    update_processing_status_batch
 )
 
 logger = get_logger("cognify")
@@ -44,6 +43,7 @@ async def cognify(
     vector_db_config: dict = None,
     graph_db_config: dict = None,
     run_in_background: bool = False,
+    target_status: Optional[Union[FileProcessingStatus, List[FileProcessingStatus]]] = FileProcessingStatus.UNPROCESSED,
 ):
     """
     Transform ingested data into a structured knowledge graph.
@@ -106,6 +106,11 @@ async def cognify(
                           If False, waits for completion before returning.
                           Background mode recommended for large datasets (>100MB).
                           Use pipeline_run_id from return value to monitor progress.
+        target_status: Status(es) of files to process. Can be:
+                      - Single status (e.g., FileProcessingStatus.UNPROCESSED)
+                      - List of statuses (e.g., [FileProcessingStatus.ERROR, FileProcessingStatus.UNPROCESSED])
+                      - None to process all files regardless of status
+                      Default: FileProcessingStatus.UNPROCESSED
 
     Returns:
         Union[dict, list[PipelineRunInfo]]:
@@ -199,6 +204,7 @@ async def cognify(
             datasets=datasets,
             vector_db_config=vector_db_config,
             graph_db_config=graph_db_config,
+            target_status=target_status,
         )
     else:
         return await run_cognify_blocking(
@@ -207,6 +213,7 @@ async def cognify(
             datasets=datasets,
             vector_db_config=vector_db_config,
             graph_db_config=graph_db_config,
+            target_status=target_status,
         )
 
 
@@ -216,6 +223,7 @@ async def run_cognify_blocking(
     datasets,
     graph_db_config: dict = None,
     vector_db_config: dict = False,
+    target_status: Optional[Union[FileProcessingStatus, List[FileProcessingStatus]]] = FileProcessingStatus.UNPROCESSED,
 ):
     if not datasets:
         raise ValueError("Datasets parameter is required")
@@ -224,13 +232,26 @@ async def run_cognify_blocking(
     if isinstance(datasets, str):
         datasets = [datasets]
     
-    # Get file data for tracking
-    file_data_items = await prepare_files_for_status_tracking(datasets, user.id)
+    # Normalize target_status to list
+    if target_status is not None and not isinstance(target_status, list):
+        target_status = [target_status]
     
-    # Set files to PROCESSING status at pipeline start
-    if file_data_items:
-        file_ids = [data.id for data in file_data_items]
+    # Get file data for tracking, filtering for target status if specified
+    file_data_items = await prepare_files_for_tracking(datasets, user.id)
+    target_files = file_data_items if target_status is None else [
+        f for f in file_data_items if f.processing_status in target_status
+    ]
+    
+    # Only proceed if we have files to process
+    if target_files:
+        file_ids = [data.id for data in target_files]
         await update_processing_status_batch(file_ids, FileProcessingStatus.PROCESSING)
+        status_str = "ANY" if target_status is None else ", ".join(s.value for s in target_status)
+        logger.info(f"Processing {len(target_files)} files with status(es): {status_str}")
+    else:
+        status_str = "ANY" if target_status is None else ", ".join(s.value for s in target_status)
+        logger.debug(f"No files with status(es) {status_str} found in datasets: {datasets}")
+        return {}
     
     total_run_info = {}
     
@@ -241,9 +262,10 @@ async def run_cognify_blocking(
         pipeline_name="cognify_pipeline",
         graph_db_config=graph_db_config,
         vector_db_config=vector_db_config,
+        data=target_files  # Pass target files as data
     ):
         # Update file status based on pipeline run completion
-        await update_file_status_from_pipeline_run(run_info, file_data_items)
+        await update_file_status_from_pipeline_run(run_info, target_files)
         
         if run_info.dataset_id:
             total_run_info[run_info.dataset_id] = run_info
@@ -258,6 +280,7 @@ async def run_cognify_as_background_process(
     datasets,
     graph_db_config: dict = None,
     vector_db_config: dict = False,
+    target_status: Optional[Union[FileProcessingStatus, List[FileProcessingStatus]]] = FileProcessingStatus.UNPROCESSED,
 ):
     if not datasets:
         raise ValueError("Datasets parameter is required")
@@ -266,13 +289,24 @@ async def run_cognify_as_background_process(
     if isinstance(datasets, str):
         datasets = [datasets]
     
-    # Get file data for tracking
-    file_data_items = await prepare_files_for_status_tracking(datasets, user.id)
+    # Normalize target_status to list
+    if target_status is not None and not isinstance(target_status, list):
+        target_status = [target_status]
     
-    # Set files to PROCESSING status at pipeline start
-    if file_data_items:
-        file_ids = [data.id for data in file_data_items]
+    # Get file data for tracking, filtering for target status if specified
+    file_data_items = await prepare_files_for_tracking(datasets, user.id)
+    target_files = file_data_items if target_status is None else [
+        f for f in file_data_items if f.processing_status in target_status
+    ]
+    
+    # Only proceed if we have files to process
+    if target_files:
+        file_ids = [data.id for data in target_files]
         await update_processing_status_batch(file_ids, FileProcessingStatus.PROCESSING)
+    else:
+        status_str = "ANY" if target_status is None else ", ".join(s.value for s in target_status)
+        logger.debug(f"No files with status(es) {status_str} found in datasets: {datasets}")
+        return []
     
     # Store pipeline status for all pipelines
     pipeline_run_started_info = []
@@ -306,6 +340,7 @@ async def run_cognify_as_background_process(
             pipeline_name="cognify_pipeline",
             graph_db_config=graph_db_config,
             vector_db_config=vector_db_config,
+            data=target_files  # Pass target files as data
         )
 
         # Save dataset Pipeline run started info
@@ -313,7 +348,7 @@ async def run_cognify_as_background_process(
         pipeline_list.append(pipeline_run)
 
     # Send all started pipelines to execute one by one in background
-    background_task = asyncio.create_task(handle_rest_of_the_run(pipeline_list, file_data_items))
+    background_task = asyncio.create_task(handle_rest_of_the_run(pipeline_list, target_files))
     
     # Add task to background tasks set to prevent garbage collection
     if not hasattr(asyncio, '_background_tasks'):
@@ -330,44 +365,53 @@ async def update_file_status_from_pipeline_run(run_info, file_data_items):
         return
     
     try:
+        # Get the IDs of files we're tracking in this run (only unprocessed ones)
+        tracked_file_ids = {f.id for f in file_data_items}
+        
         # Handle file-level processing results
         if isinstance(run_info, PipelineRunCompleted):
-            # Use file-level results if available, otherwise fall back to dataset-level
+            # Use file-level results if available
             if hasattr(run_info, 'processed_file_ids') and run_info.processed_file_ids:
-                await update_processing_status_batch(run_info.processed_file_ids, FileProcessingStatus.PROCESSED)
-                logger.info(f"Marked {len(run_info.processed_file_ids)} files as PROCESSED for dataset {run_info.dataset_id}")
+                # Only update files that were unprocessed when we started
+                files_to_mark_processed = [fid for fid in run_info.processed_file_ids if fid in tracked_file_ids]
+                if files_to_mark_processed:
+                    await update_processing_status_batch(files_to_mark_processed, FileProcessingStatus.PROCESSED)
+                    logger.debug(f"Marked {len(files_to_mark_processed)} files as PROCESSED for dataset {run_info.dataset_id}")
             
             if hasattr(run_info, 'failed_file_ids') and run_info.failed_file_ids:
-                await update_processing_status_batch(run_info.failed_file_ids, FileProcessingStatus.ERROR)
-                logger.warning(f"Marked {len(run_info.failed_file_ids)} files as ERROR for dataset {run_info.dataset_id}")
+                # Only update files that were unprocessed when we started
+                files_to_mark_error = [fid for fid in run_info.failed_file_ids if fid in tracked_file_ids]
+                if files_to_mark_error:
+                    await update_processing_status_batch(files_to_mark_error, FileProcessingStatus.ERROR)
+                    logger.debug(f"Marked {len(files_to_mark_error)} files as ERROR for dataset {run_info.dataset_id}")
             
-            # If no file-level info available, mark all files as processed (backward compatibility)
+            # If no file-level info available, mark only tracked unprocessed files as processed
             if not (hasattr(run_info, 'processed_file_ids') and run_info.processed_file_ids) and \
                not (hasattr(run_info, 'failed_file_ids') and run_info.failed_file_ids):
-                dataset_files = await get_dataset_data(run_info.dataset_id)
-                if dataset_files:
-                    file_ids = [f.id for f in dataset_files]
-                    await update_processing_status_batch(file_ids, FileProcessingStatus.PROCESSED)
-                    logger.info(f"Marked all {len(file_ids)} files as PROCESSED for dataset {run_info.dataset_id} (no file-level data)")
+                await update_processing_status_batch(list(tracked_file_ids), FileProcessingStatus.PROCESSED)
+                logger.debug(f"Marked {len(tracked_file_ids)} unprocessed files as PROCESSED for dataset {run_info.dataset_id}")
                     
         elif isinstance(run_info, PipelineRunErrored):
             # Use file-level results if available
             if hasattr(run_info, 'processed_file_ids') and run_info.processed_file_ids:
-                await update_processing_status_batch(run_info.processed_file_ids, FileProcessingStatus.PROCESSED)
-                logger.info(f"Marked {len(run_info.processed_file_ids)} files as PROCESSED before error for dataset {run_info.dataset_id}")
+                # Only update files that were unprocessed when we started
+                files_to_mark_processed = [fid for fid in run_info.processed_file_ids if fid in tracked_file_ids]
+                if files_to_mark_processed:
+                    await update_processing_status_batch(files_to_mark_processed, FileProcessingStatus.PROCESSED)
+                    logger.debug(f"Marked {len(files_to_mark_processed)} files as PROCESSED before error for dataset {run_info.dataset_id}")
             
             if hasattr(run_info, 'failed_file_ids') and run_info.failed_file_ids:
-                await update_processing_status_batch(run_info.failed_file_ids, FileProcessingStatus.ERROR)
-                logger.warning(f"Marked {len(run_info.failed_file_ids)} files as ERROR for dataset {run_info.dataset_id}")
+                # Only update files that were unprocessed when we started
+                files_to_mark_error = [fid for fid in run_info.failed_file_ids if fid in tracked_file_ids]
+                if files_to_mark_error:
+                    await update_processing_status_batch(files_to_mark_error, FileProcessingStatus.ERROR)
+                    logger.debug(f"Marked {len(files_to_mark_error)} files as ERROR for dataset {run_info.dataset_id}")
             
-            # If no file-level info available, mark all files as error (backward compatibility)
+            # If no file-level info available, mark only tracked unprocessed files as error
             if not (hasattr(run_info, 'processed_file_ids') and run_info.processed_file_ids) and \
                not (hasattr(run_info, 'failed_file_ids') and run_info.failed_file_ids):
-                dataset_files = await get_dataset_data(run_info.dataset_id)
-                if dataset_files:
-                    file_ids = [f.id for f in dataset_files]
-                    await update_processing_status_batch(file_ids, FileProcessingStatus.ERROR)
-                    logger.warning(f"Marked all {len(file_ids)} files as ERROR for dataset {run_info.dataset_id} (no file-level data)")
+                await update_processing_status_batch(list(tracked_file_ids), FileProcessingStatus.ERROR)
+                logger.debug(f"Marked {len(tracked_file_ids)} unprocessed files as ERROR for dataset {run_info.dataset_id}")
                     
     except Exception as error:
         logger.error(f"Failed to update file status for dataset {run_info.dataset_id}: {error}")

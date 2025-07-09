@@ -35,3 +35,4 @@ class PipelineRunErrored(PipelineRunInfo):
     status: str = "PipelineRunErrored"
     processed_file_ids: Optional[List[UUID]] = None  # Files that were successfully processed before error
     failed_file_ids: Optional[List[UUID]] = None     # Files that failed during processing
+    unprocessed_file_ids: Optional[List[UUID]] = None  # Files that were not processed
