@@ -104,6 +104,7 @@ async def run_tasks(
     initial_file_ids = set()
     processed_file_ids = set()
     failed_file_ids = set()
+    currently_processing = set()  # Track which files are currently being processed
     
     if isinstance(data, list):
         for item in data:
@@ -133,11 +134,15 @@ async def run_tasks(
         ):
             last_result = result
             
-            # Track only explicitly processed/failed files
+            # Track files being processed and their outcomes
+            if hasattr(result, 'processing_files'):
+                currently_processing.update(result.processing_files)
             if hasattr(result, 'processed_files'):
                 processed_file_ids.update(result.processed_files)
+                currently_processing.difference_update(result.processed_files)
             if hasattr(result, 'failed_files'):
                 failed_file_ids.update(result.failed_files)
+                currently_processing.difference_update(result.failed_files)
             
             yield PipelineRunYield(
                 pipeline_run_id=pipeline_run_id,
@@ -146,20 +151,26 @@ async def run_tasks(
                 payload=result,
             )
 
-        # Calculate unprocessed files (not explicitly processed or failed)
-        unprocessed_file_ids = initial_file_ids - processed_file_ids - failed_file_ids
+        # On successful completion:
+        # - Files that completed processing are already marked PROCESSED
+        # - Files that failed are already marked ERROR
+        # - Files that were never started remain UNPROCESSED
+        # - Files that were in progress but not completed are marked ERROR
+        if currently_processing:
+            failed_file_ids.update(currently_processing)
+            logger.warning(f"Marking {len(currently_processing)} incomplete files as ERROR")
 
         logger.info(f"Pipeline completed:")
-        logger.info(f"- Processed: {len(processed_file_ids)} files")
-        logger.info(f"- Failed: {len(failed_file_ids)} files")
-        logger.info(f"- Remaining unprocessed: {len(unprocessed_file_ids)} files")
+        logger.info(f"- Successfully processed: {len(processed_file_ids)} files")
+        logger.info(f"- Failed/Error: {len(failed_file_ids)} files")
+        unprocessed_count = len(initial_file_ids - processed_file_ids - failed_file_ids)
+        if unprocessed_count > 0:
+            logger.info(f"- Remaining unprocessed: {unprocessed_count} files")
 
         if processed_file_ids:
             logger.info(f"Successfully processed file IDs: {list(processed_file_ids)}")
         if failed_file_ids:
             logger.warning(f"Failed file IDs: {list(failed_file_ids)}")
-        if unprocessed_file_ids:
-            logger.info(f"Unprocessed file IDs: {list(unprocessed_file_ids)}")
 
         await log_pipeline_run_complete(
             pipeline_run_id, pipeline_id, pipeline_name, dataset_id, last_result
@@ -174,13 +185,20 @@ async def run_tasks(
         )
 
     except Exception as error:
-        # On pipeline error, track unprocessed files separately from failed files
-        unprocessed_file_ids = initial_file_ids - processed_file_ids - failed_file_ids
+        # On pipeline error:
+        # - Successfully processed files stay PROCESSED
+        # - Failed files stay ERROR
+        # - Files that were in progress are marked ERROR
+        # - Files that were never started remain UNPROCESSED
+        if currently_processing:
+            failed_file_ids.update(currently_processing)
+            logger.warning(f"Marking {len(currently_processing)} in-progress files as ERROR due to pipeline failure")
 
         logger.error(f"Pipeline errored:")
-        logger.error(f"- Processed: {len(processed_file_ids)} files")
-        logger.error(f"- Failed: {len(failed_file_ids)} files")
-        logger.error(f"- Remaining unprocessed: {len(unprocessed_file_ids)} files")
+        logger.error(f"- Successfully processed: {len(processed_file_ids)} files")
+        logger.error(f"- Failed/Error: {len(failed_file_ids)} files")
+        unprocessed_count = len(initial_file_ids - processed_file_ids - failed_file_ids)
+        logger.error(f"- Remaining unprocessed: {unprocessed_count} files")
 
         await log_pipeline_run_error(
             pipeline_run_id, pipeline_id, pipeline_name, dataset_id, data, error
@@ -193,5 +211,6 @@ async def run_tasks(
             dataset_name=dataset.name,
             processed_file_ids=list(processed_file_ids) if processed_file_ids else None,
             failed_file_ids=list(failed_file_ids) if failed_file_ids else None,
-            unprocessed_file_ids=list(unprocessed_file_ids) if unprocessed_file_ids else None,
         )
+        
+        raise error

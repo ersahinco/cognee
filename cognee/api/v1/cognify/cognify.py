@@ -106,11 +106,6 @@ async def cognify(
                           If False, waits for completion before returning.
                           Background mode recommended for large datasets (>100MB).
                           Use pipeline_run_id from return value to monitor progress.
-        target_status: Status(es) of files to process. Can be:
-                      - Single status (e.g., FileProcessingStatus.UNPROCESSED)
-                      - List of statuses (e.g., [FileProcessingStatus.ERROR, FileProcessingStatus.UNPROCESSED])
-                      - None to process all files regardless of status
-                      Default: FileProcessingStatus.UNPROCESSED
 
     Returns:
         Union[dict, list[PipelineRunInfo]]:
@@ -246,11 +241,17 @@ async def run_cognify_blocking(
     if target_files:
         file_ids = [data.id for data in target_files]
         await update_processing_status_batch(file_ids, FileProcessingStatus.PROCESSING)
-        status_str = "ANY" if target_status is None else ", ".join(s.value for s in target_status)
-        logger.info(f"Processing {len(target_files)} files with status(es): {status_str}")
+        if target_status is None:
+            logger.info(f"Processing all {len(target_files)} files (no status filter)")
+        else:
+            status_str = ", ".join(s.value for s in target_status)
+            logger.info(f"Processing {len(target_files)} files with status(es): {status_str}")
     else:
-        status_str = "ANY" if target_status is None else ", ".join(s.value for s in target_status)
-        logger.debug(f"No files with status(es) {status_str} found in datasets: {datasets}")
+        if target_status is None:
+            logger.debug(f"No files found in datasets: {datasets}")
+        else:
+            status_str = ", ".join(s.value for s in target_status)
+            logger.debug(f"No files with status(es) {status_str} found in datasets: {datasets}")
         return {}
     
     total_run_info = {}
